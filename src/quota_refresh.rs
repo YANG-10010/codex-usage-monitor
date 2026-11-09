@@ -211,11 +211,11 @@ mod tests {
         UsageData {
             session: UsageSection {
                 percentage: session,
-                resets_at: None,
+                ..UsageSection::default()
             },
             weekly: UsageSection {
                 percentage: weekly,
-                resets_at: None,
+                ..UsageSection::default()
             },
         }
     }

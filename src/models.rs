@@ -1,9 +1,10 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Default)]
 pub struct UsageSection {
     pub percentage: f64,
     pub resets_at: Option<SystemTime>,
+    pub window_duration: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default)]

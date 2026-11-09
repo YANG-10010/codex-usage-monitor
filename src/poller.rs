@@ -916,6 +916,7 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
         percentage: window.used_percent,
         resets_at: unix_to_system_time(Some(window.reset_at)),
+        window_duration: window.limit_window_seconds.map(Duration::from_secs),
     }
 }
 
@@ -1096,6 +1097,7 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSe
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
+        ..UsageSection::default()
     })
 }
 
@@ -1106,6 +1108,7 @@ fn antigravity_section_from_summary_bucket(
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+        ..UsageSection::default()
     })
 }
 
@@ -1863,7 +1866,7 @@ mod tests {
         assert_eq!(strings.weekly_window, "7d");
         let section = UsageSection {
             percentage: 30.0,
-            resets_at: None,
+            ..UsageSection::default()
         };
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),

@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, UsageData, UsageSection};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
     TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -68,9 +68,7 @@ struct AppState {
     session_text: String,
     weekly_percent: f64,
     weekly_text: String,
-    codex_session_percent: f64,
     codex_session_text: String,
-    codex_weekly_percent: f64,
     codex_weekly_text: String,
     antigravity_session_percent: f64,
     antigravity_session_text: String,
@@ -82,6 +80,7 @@ struct AppState {
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
+    show_codex_meter_text: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
 
@@ -104,6 +103,7 @@ struct AppState {
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
     drag_start_offset: i32,
+    pressed_codex_meter: Option<poller::UsageWindowKind>,
 
     widget_visible: bool,
 }
@@ -149,6 +149,7 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
+const IDM_SHOW_CODEX_METER_TEXT: u16 = 73;
 const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
@@ -450,10 +451,12 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
-    #[serde(default = "default_show_usage_window")]
+    #[serde(default = "default_usage_display_enabled")]
     show_session_window: bool,
-    #[serde(default = "default_show_usage_window")]
+    #[serde(default = "default_usage_display_enabled")]
     show_weekly_window: bool,
+    #[serde(default = "default_usage_display_enabled")]
+    show_codex_meter_text: bool,
     #[serde(default)]
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -478,6 +481,7 @@ impl Default for SettingsFile {
             show_antigravity: false,
             show_session_window: true,
             show_weekly_window: true,
+            show_codex_meter_text: true,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
         }
@@ -508,7 +512,7 @@ fn default_show_antigravity() -> bool {
     false
 }
 
-fn default_show_usage_window() -> bool {
+fn default_usage_display_enabled() -> bool {
     true
 }
 
@@ -611,6 +615,7 @@ fn save_state_settings() {
             show_antigravity: s.show_antigravity,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
+            show_codex_meter_text: s.show_codex_meter_text,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         })
@@ -1625,6 +1630,101 @@ const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
+const CODEX_METER_WIDTH: i32 = 158;
+const CODEX_METER_ROW_PADDING: i32 = 5;
+
+fn usage_row_positions(
+    height: i32,
+    appearance: Appearance,
+    show_codex: bool,
+    show_session: bool,
+    show_weekly: bool,
+) -> [i32; 2] {
+    let row_height = appearance.row_height();
+    if !show_session || !show_weekly {
+        return [(height - row_height) / 2; 2];
+    }
+    let step = if show_codex {
+        row_height - sc(CODEX_METER_ROW_PADDING) + sc(3)
+    } else {
+        row_height
+            + if height < sc(WIDGET_HEIGHT) {
+                sc(2)
+            } else {
+                sc(8)
+            }
+    };
+    let first = (height - row_height - step).max(0) / 2;
+    [first, first + step]
+}
+
+fn codex_meter_rect(x: i32, y: i32, width: i32, appearance: Appearance) -> RECT {
+    let padding = sc(CODEX_METER_ROW_PADDING);
+    let top = y + padding / 2;
+    RECT {
+        left: x,
+        top,
+        right: x + width,
+        bottom: top + appearance.row_height() - padding,
+    }
+}
+
+fn codex_meter_at_point(hwnd: HWND, point: POINT) -> Option<poller::UsageWindowKind> {
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client).ok()? };
+    let state = lock_state();
+    let s = state.as_ref().filter(|s| s.show_codex)?;
+    let active_models = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
+    let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+    let (x, width) = if active_models == 1 {
+        (content_x, sc(CODEX_METER_WIDTH))
+    } else {
+        let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
+        let column_width = model_usage_width(row_bar_segment_count(active_models), text_width);
+        let icon_width = sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN);
+        let mut x = content_x + label_width + sc(LABEL_RIGHT_MARGIN) + icon_width;
+        if s.show_claude_code {
+            x += column_width + sc(MODEL_RIGHT_MARGIN);
+        }
+        (x, column_width - icon_width)
+    };
+    let [session_y, weekly_y] = usage_row_positions(
+        client.bottom - client.top,
+        s.appearance,
+        true,
+        s.show_session_window,
+        s.show_weekly_window,
+    );
+    for (visible, y, kind) in [
+        (
+            s.show_session_window,
+            session_y,
+            poller::UsageWindowKind::Session,
+        ),
+        (
+            s.show_weekly_window,
+            weekly_y,
+            poller::UsageWindowKind::Weekly,
+        ),
+    ] {
+        let rect = codex_meter_rect(x, y, width, s.appearance);
+        if visible
+            && (rect.left..rect.right).contains(&point.x)
+            && (rect.top..rect.bottom).contains(&point.y)
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+fn toggle_codex_meter_text() {
+    if let Some(s) = lock_state().as_mut() {
+        s.show_codex_meter_text = !s.show_codex_meter_text;
+    }
+    save_state_settings();
+    render_layered();
+}
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -1764,18 +1864,25 @@ fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 
     }
 }
 
-fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
+fn total_widget_width_for(
+    active_models: i32,
+    show_codex: bool,
+    language: LanguageId,
+    appearance: Appearance,
+) -> i32 {
+    let outer_width = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + sc(RIGHT_MARGIN);
+    if show_codex && active_models == 1 {
+        return outer_width + sc(CODEX_METER_WIDTH);
+    }
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
     let model_width = model_usage_width(bar_segments, text_width);
 
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
+    outer_width
         + label_width
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -1785,26 +1892,28 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
             state.show_codex,
             state.show_antigravity,
         ),
+        state.show_codex,
         state.language,
         state.appearance,
     )
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance) = {
+    let (active_models, show_codex, language, appearance) = {
         let state = lock_state();
         state
             .as_ref()
             .map(|s| {
                 (
                     active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    s.show_codex,
                     s.language,
                     s.appearance,
                 )
             })
-            .unwrap_or((1, LanguageId::English, Appearance::default()))
+            .unwrap_or((1, true, LanguageId::English, Appearance::default()))
     };
-    total_widget_width_for(active_models, language, appearance)
+    total_widget_width_for(active_models, show_codex, language, appearance)
 }
 
 fn claude_accent_color() -> Color {
@@ -1956,7 +2065,12 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count, language, settings.appearance),
+            total_widget_width_for(
+                initial_model_count,
+                settings.show_codex,
+                language,
+                settings.appearance,
+            ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -2004,9 +2118,7 @@ pub fn run() {
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
-                codex_session_percent: 0.0,
                 codex_session_text: "--".to_string(),
-                codex_weekly_percent: 0.0,
                 codex_weekly_text: "--".to_string(),
                 antigravity_session_percent: 0.0,
                 antigravity_session_text: "--".to_string(),
@@ -2018,6 +2130,7 @@ pub fn run() {
                 show_antigravity: settings.show_antigravity,
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
+                show_codex_meter_text: settings.show_codex_meter_text,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
@@ -2044,6 +2157,7 @@ pub fn run() {
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
+                pressed_codex_meter: None,
                 widget_visible: settings.widget_visible,
             });
         }
@@ -2144,12 +2258,14 @@ fn update_quota_tooltips() {
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
-            let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
-            let mut left = sc(LEFT_DIVIDER_W)
-                + sc(DIVIDER_RIGHT_MARGIN)
-                + label_width
-                + sc(LABEL_RIGHT_MARGIN);
+            let mut left = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+            let width = if s.show_codex && count == 1 {
+                sc(CODEX_METER_WIDTH)
+            } else {
+                let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
+                left += label_width + sc(LABEL_RIGHT_MARGIN);
+                model_usage_width(row_bar_segment_count(count), text_width)
+            };
             for (id, visible, name, session, weekly) in [
                 (
                     0,
@@ -2226,10 +2342,9 @@ fn render_layered() {
         session_text,
         weekly_pct,
         weekly_text,
-        codex_session_pct,
         codex_session_text,
-        codex_weekly_pct,
         codex_weekly_text,
+        codex_usage,
         antigravity_session_pct,
         antigravity_session_text,
         antigravity_weekly_pct,
@@ -2239,6 +2354,7 @@ fn render_layered() {
         show_antigravity,
         show_session_window,
         show_weekly_window,
+        show_codex_meter_text,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2253,10 +2369,9 @@ fn render_layered() {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
-                s.codex_session_percent,
                 s.codex_session_text.clone(),
-                s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
+                s.data.as_ref().and_then(|data| data.codex.clone()),
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
@@ -2266,6 +2381,7 @@ fn render_layered() {
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
+                s.show_codex_meter_text,
             ),
             None => return,
         }
@@ -2293,7 +2409,6 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2345,10 +2460,9 @@ fn render_layered() {
             &session_text,
             weekly_pct,
             &weekly_text,
-            codex_session_pct,
             &codex_session_text,
-            codex_weekly_pct,
             &codex_weekly_text,
+            codex_usage.as_ref(),
             antigravity_session_pct,
             &antigravity_session_text,
             antigravity_weekly_pct,
@@ -2358,7 +2472,7 @@ fn render_layered() {
             show_antigravity,
             show_session_window,
             show_weekly_window,
-            &codex_accent,
+            show_codex_meter_text,
             &antigravity_accent,
         );
 
@@ -2430,10 +2544,9 @@ fn paint_content(
     session_text: &str,
     weekly_pct: f64,
     weekly_text: &str,
-    codex_session_pct: f64,
     codex_session_text: &str,
-    codex_weekly_pct: f64,
     codex_weekly_text: &str,
+    codex_usage: Option<&UsageData>,
     antigravity_session_pct: f64,
     antigravity_session_text: &str,
     antigravity_weekly_pct: f64,
@@ -2443,18 +2556,11 @@ fn paint_content(
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
-    codex_accent: &Color,
+    show_codex_meter_text: bool,
     antigravity_accent: &Color,
 ) {
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
-        let session_pct = usage_percent_for_display(language, session_pct);
-        let weekly_pct = usage_percent_for_display(language, weekly_pct);
-        let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
-        let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
-        let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
-        let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
-        let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
             left: 0,
@@ -2505,14 +2611,13 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row_gap = if height < sc(WIDGET_HEIGHT) {
-            sc(2)
-        } else {
-            sc(8)
-        };
-        let row1_y = (height - 2 * appearance.row_height() - row_gap).max(0) / 2;
-        let row2_y = row1_y + appearance.row_height() + row_gap;
-        let single_row_y = (height - appearance.row_height()) / 2;
+        let [session_y, weekly_y] = usage_row_positions(
+            height,
+            appearance,
+            show_codex,
+            show_session_window,
+            show_weekly_window,
+        );
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -2520,10 +2625,64 @@ fn paint_content(
         let font = create_widget_font(appearance);
         let old_font = SelectObject(hdc, font);
 
+        let now = SystemTime::now();
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let rows = [
+            (
+                show_session_window,
+                session_y,
+                strings.session_window,
+                session_pct,
+                session_text,
+                CodexMeter::new(
+                    codex_usage.map(|usage| &usage.session),
+                    codex_session_text,
+                    poller::UsageWindowKind::Session,
+                    now,
+                ),
+                antigravity_session_pct,
+                antigravity_session_text,
+            ),
+            (
+                show_weekly_window,
+                weekly_y,
+                strings.weekly_window,
+                weekly_pct,
+                weekly_text,
+                CodexMeter::new(
+                    codex_usage.map(|usage| &usage.weekly),
+                    codex_weekly_text,
+                    poller::UsageWindowKind::Weekly,
+                    now,
+                ),
+                antigravity_weekly_pct,
+                antigravity_weekly_text,
+            ),
+        ];
+
+        if show_codex && active_models == 1 {
+            for (visible, y, _, _, _, codex, _, _) in rows {
+                if visible {
+                    draw_codex_meter(
+                        hdc,
+                        content_x,
+                        y,
+                        sc(CODEX_METER_WIDTH),
+                        appearance,
+                        codex,
+                        show_codex_meter_text,
+                    );
+                }
+            }
+            SelectObject(hdc, old_font);
+            let _ = DeleteObject(font);
+            return;
+        }
+
         // One provider mark per column, centered across the visible quota rows.
+        let (label_width, text_width) = usage_layout_widths(language, appearance);
         let icon_size = sc(provider_icons::SIZE);
         let icon_y = (height - icon_size) / 2;
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
         let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
             + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
@@ -2535,60 +2694,38 @@ fn paint_content(
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
         }
 
-        if show_session_window {
+        for (
+            visible,
+            y,
+            label,
+            claude_pct,
+            claude_text,
+            codex,
+            antigravity_pct,
+            antigravity_text,
+        ) in rows
+        {
+            if !visible {
+                continue;
+            }
             draw_row(
                 hdc,
                 content_x,
-                if show_weekly_window {
-                    row1_y
-                } else {
-                    single_row_y
-                },
+                y,
                 is_dark,
                 appearance,
                 text_color,
-                strings.session_window,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                antigravity_session_pct,
-                antigravity_session_text,
+                label,
+                usage_percent_for_display(language, claude_pct),
+                claude_text,
+                codex,
+                show_codex_meter_text,
+                usage_percent_for_display(language, antigravity_pct),
+                antigravity_text,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
                 accent,
-                codex_accent,
-                antigravity_accent,
-                track,
-                label_width,
-                text_width,
-            );
-        }
-        if show_weekly_window {
-            draw_row(
-                hdc,
-                content_x,
-                if show_session_window {
-                    row2_y
-                } else {
-                    single_row_y
-                },
-                is_dark,
-                appearance,
-                text_color,
-                strings.weekly_window,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                antigravity_weekly_pct,
-                antigravity_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
                 antigravity_accent,
                 track,
                 label_width,
@@ -2742,11 +2879,6 @@ fn complete_provider_poll(
                 cached.claude_code.as_ref(),
                 &mut s.session_percent,
                 &mut s.weekly_percent,
-            ),
-            (
-                cached.codex.as_ref(),
-                &mut s.codex_session_percent,
-                &mut s.codex_weekly_percent,
             ),
             (
                 cached.antigravity.as_ref(),
@@ -3227,9 +3359,18 @@ unsafe extern "system" fn wnd_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
-            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y) {
+            let point = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            if !is_drag_handle_point(point.x, point.y) {
+                let pressed = codex_meter_at_point(hwnd, point);
+                if let Some(s) = lock_state().as_mut() {
+                    s.pressed_codex_meter = pressed;
+                }
+                if pressed.is_some() {
+                    SetCapture(hwnd);
+                }
                 return LRESULT(0);
             }
 
@@ -3237,14 +3378,16 @@ unsafe extern "system" fn wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
+                s.pressed_codex_meter = None;
                 if s.anchor_left {
                     return LRESULT(0);
                 }
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
-                s.drag_start_client_x = client_x;
+                s.drag_start_client_x = point.x;
                 s.drag_start_offset = s.tray_offset;
             }
+            drop(state);
             SetCapture(hwnd);
             LRESULT(0)
         }
@@ -3345,6 +3488,20 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            let pressed = lock_state()
+                .as_mut()
+                .and_then(|s| s.pressed_codex_meter.take());
+            if let Some(pressed) = pressed {
+                let _ = ReleaseCapture();
+                let point = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                if codex_meter_at_point(hwnd, point) == Some(pressed) {
+                    toggle_codex_meter_text();
+                }
+                return LRESULT(0);
+            }
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let drag_result = {
@@ -3391,6 +3548,12 @@ unsafe extern "system" fn wnd_proc(
                 save_state_settings();
             }
             LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if let Some(s) = lock_state().as_mut() {
+                s.pressed_codex_meter = None;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_RBUTTONUP => {
             show_context_menu(hwnd);
@@ -3566,6 +3729,7 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_SHOW_CODEX_METER_TEXT => toggle_codex_meter_text(),
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
                 | IDM_PALETTE_SYSTEM
@@ -3791,6 +3955,7 @@ fn show_context_menu(hwnd: HWND) {
             show_antigravity,
             show_session_window,
             show_weekly_window,
+            show_codex_meter_text,
             alert_threshold_percent,
             appearance,
         ) = {
@@ -3810,6 +3975,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_antigravity,
                     s.show_session_window,
                     s.show_weekly_window,
+                    s.show_codex_meter_text,
                     s.alert_threshold_percent,
                     s.appearance,
                 ),
@@ -3825,6 +3991,7 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     false,
                     false,
+                    true,
                     true,
                     true,
                     0,
@@ -3978,6 +4145,23 @@ fn show_context_menu(hwnd: HWND) {
             weekly_flags,
             IDM_SHOW_WEEKLY_WINDOW as usize,
             PCWSTR::from_raw(weekly_label.as_ptr()),
+        );
+        let meter_text_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "显示进度条文字"
+            } else {
+                "Show progress bar text"
+            });
+        let meter_text_flags = if show_codex_meter_text {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            usage_menu,
+            meter_text_flags,
+            IDM_SHOW_CODEX_METER_TEXT as usize,
+            PCWSTR::from_raw(meter_text_label.as_ptr()),
         );
         let usage_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
             "显示用量"
@@ -4396,10 +4580,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
         session_text,
         weekly_pct,
         weekly_text,
-        codex_session_pct,
         codex_session_text,
-        codex_weekly_pct,
         codex_weekly_text,
+        codex_usage,
         antigravity_session_pct,
         antigravity_session_text,
         antigravity_weekly_pct,
@@ -4409,6 +4592,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_antigravity,
         show_session_window,
         show_weekly_window,
+        show_codex_meter_text,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -4421,10 +4605,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
-                s.codex_session_percent,
                 s.codex_session_text.clone(),
-                s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
+                s.data.as_ref().and_then(|data| data.codex.clone()),
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
@@ -4434,6 +4617,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
+                s.show_codex_meter_text,
             ),
             None => return,
         }
@@ -4441,7 +4625,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4474,10 +4657,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &session_text,
             weekly_pct,
             &weekly_text,
-            codex_session_pct,
             &codex_session_text,
-            codex_weekly_pct,
             &codex_weekly_text,
+            codex_usage.as_ref(),
             antigravity_session_pct,
             &antigravity_session_text,
             antigravity_weekly_pct,
@@ -4487,7 +4669,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             show_session_window,
             show_weekly_window,
-            &codex_accent,
+            show_codex_meter_text,
             &antigravity_accent,
         );
 
@@ -4509,15 +4691,14 @@ fn draw_row(
     label: &str,
     claude_percent: f64,
     claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
+    codex: CodexMeter<'_>,
+    show_codex_meter_text: bool,
     antigravity_percent: f64,
     antigravity_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
     claude_accent: &Color,
-    codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
     label_width: i32,
@@ -4532,7 +4713,6 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = provider_icons::codex_color(is_dark);
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -4574,21 +4754,18 @@ fn draw_row(
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
-            draw_usage_bar(
+            let icon_width = sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN);
+            let column_width = model_usage_width(segment_count, text_width);
+            draw_codex_meter(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + icon_width,
                 y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-                text_width,
-                is_dark,
+                column_width - icon_width,
                 appearance,
+                codex,
+                show_codex_meter_text,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -4607,6 +4784,230 @@ fn draw_row(
             );
         }
     }
+}
+
+struct CodexMeter<'a> {
+    kind: poller::UsageWindowKind,
+    status: &'a str,
+    remaining_quota: Option<f64>,
+    remaining_time: Option<(f64, Duration)>,
+}
+
+impl<'a> CodexMeter<'a> {
+    fn new(
+        section: Option<&UsageSection>,
+        status: &'a str,
+        kind: poller::UsageWindowKind,
+        now: SystemTime,
+    ) -> Self {
+        let fallback = Duration::from_secs(match kind {
+            poller::UsageWindowKind::Session => 5 * 3600,
+            poller::UsageWindowKind::Weekly => 7 * 86400,
+        });
+        let section = section.filter(|s| {
+            s.percentage != 0.0 || s.resets_at.is_some() || s.window_duration.is_some()
+        });
+        let remaining_quota = section.map(|s| poller::remaining_percentage(s.percentage));
+        let remaining_time = section.and_then(|s| {
+            let remaining = s.resets_at?.duration_since(now).unwrap_or_default();
+            let period = s
+                .window_duration
+                .filter(|d| !d.is_zero())
+                .unwrap_or(fallback);
+            let fraction = remaining.min(period).as_secs_f64() / period.as_secs_f64();
+            Some((fraction, remaining))
+        });
+        Self {
+            kind,
+            status,
+            remaining_quota,
+            remaining_time,
+        }
+    }
+
+    fn label(&self) -> (&'static str, String) {
+        let prefix = match self.kind {
+            poller::UsageWindowKind::Session => "5h",
+            poller::UsageWindowKind::Weekly => "7d",
+        };
+        let Some(quota) = self.remaining_quota else {
+            return (prefix, self.status.to_string());
+        };
+        let quota = quota.round() as u8;
+        let stale = if self.status.ends_with('*') { "*" } else { "" };
+        let Some((fraction, duration)) = self.remaining_time else {
+            return (prefix, format!("{quota} / --{stale}"));
+        };
+        let time = (fraction * 100.0).round() as u8;
+        let countdown = compact_codex_countdown(duration, self.kind);
+        (prefix, format!("{quota} / {time} ({countdown}){stale}"))
+    }
+}
+
+fn compact_codex_countdown(duration: Duration, kind: poller::UsageWindowKind) -> String {
+    let minutes = (duration.as_secs_f64() / 60.0).ceil() as u64;
+    let hours = minutes / 60;
+    if hours == 0 {
+        return format!("{minutes}m");
+    }
+    let (major, major_unit, minor, minor_unit) = match kind {
+        poller::UsageWindowKind::Session => (hours, 'h', minutes % 60, 'm'),
+        poller::UsageWindowKind::Weekly if hours >= 24 => (hours / 24, 'd', hours % 24, 'h'),
+        poller::UsageWindowKind::Weekly => (hours, 'h', 0, 'm'),
+    };
+    if minor == 0 {
+        format!("{major}{major_unit}")
+    } else {
+        format!("{major}{major_unit}{minor}{minor_unit}")
+    }
+}
+
+fn draw_codex_meter(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    width: i32,
+    appearance: Appearance,
+    meter: CodexMeter<'_>,
+    show_text: bool,
+) {
+    let rect = codex_meter_rect(x, y, width, appearance);
+    let diameter = sc(3);
+    unsafe {
+        let clip = CreateRoundRectRgn(
+            rect.left,
+            rect.top,
+            rect.right + 1,
+            rect.bottom + 1,
+            diameter,
+            diameter,
+        );
+        let _ = SelectClipRgn(hdc, clip);
+        let fill = |rect: &RECT, color: &str| {
+            let brush = CreateSolidBrush(COLORREF(Color::from_hex(color).to_colorref()));
+            FillRect(hdc, rect, brush);
+            let _ = DeleteObject(brush);
+        };
+        fill(&rect, "#E4EFF9");
+        if let Some(quota) = meter.remaining_quota {
+            let quota_width = (f64::from(width) * quota / 100.0).round() as i32;
+            if quota_width > 0 {
+                let vertices = [
+                    TRIVERTEX {
+                        x,
+                        y: rect.top,
+                        Red: 0x1E00,
+                        Green: 0x9300,
+                        Blue: 0xEA00,
+                        Alpha: 0,
+                    },
+                    TRIVERTEX {
+                        x: x + quota_width,
+                        y: rect.bottom,
+                        Red: 0x5400,
+                        Green: 0xB600,
+                        Blue: 0xF500,
+                        Alpha: 0,
+                    },
+                ];
+                let mesh = GRADIENT_RECT {
+                    UpperLeft: 0,
+                    LowerRight: 1,
+                };
+                if !GdiGradientFill(
+                    hdc,
+                    &vertices,
+                    std::ptr::from_ref(&mesh).cast(),
+                    1,
+                    GRADIENT_FILL_RECT_H,
+                )
+                .as_bool()
+                {
+                    fill(
+                        &RECT {
+                            right: x + quota_width,
+                            ..rect
+                        },
+                        "#309FEF",
+                    );
+                }
+            }
+        }
+        let border = CreateSolidBrush(COLORREF(Color::from_hex("#AED1F0").to_colorref()));
+        let _ = FrameRgn(hdc, clip, border, sc(1), sc(1));
+        let _ = DeleteObject(border);
+        if let Some((fraction, _)) = meter.remaining_time {
+            let stroke = sc(1).max(1);
+            let inset = sc(2);
+            let marker = (f64::from(width) * fraction).round() as i32;
+            let center = x + marker.clamp(inset, width - inset);
+            let core = RECT {
+                left: center - stroke / 2,
+                right: center - stroke / 2 + stroke,
+                ..rect
+            };
+            fill(&core, "#17324C");
+        }
+
+        if show_text {
+            draw_codex_meter_text(hdc, rect, appearance, &meter);
+        }
+        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = DeleteObject(clip);
+    }
+}
+
+unsafe fn draw_codex_meter_text(
+    hdc: HDC,
+    rect: RECT,
+    appearance: Appearance,
+    meter: &CodexMeter<'_>,
+) {
+    let (prefix, detail) = meter.label();
+    let mut prefix: Vec<u16> = prefix.encode_utf16().collect();
+    let mut detail: Vec<u16> = detail.encode_utf16().collect();
+    let mut font_spec = LOGFONTW {
+        lfHeight: -sc(appearance.font_px() - 1),
+        lfWeight: FW_NORMAL.0 as i32,
+        lfCharSet: DEFAULT_CHARSET,
+        lfQuality: CLEARTYPE_QUALITY,
+        ..Default::default()
+    };
+    for (slot, ch) in font_spec
+        .lfFaceName
+        .iter_mut()
+        .zip("Segoe UI".encode_utf16())
+    {
+        *slot = ch;
+    }
+    let detail_font = CreateFontIndirectW(&font_spec);
+    let old_font = SelectObject(hdc, detail_font);
+    let mut detail_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &detail, &mut detail_size);
+
+    font_spec.lfWeight = FW_SEMIBOLD.0 as i32;
+    let prefix_font = CreateFontIndirectW(&font_spec);
+    SelectObject(hdc, prefix_font);
+    let mut prefix_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &prefix, &mut prefix_size);
+
+    let gap = sc(8);
+    let text_width = prefix_size.cx + gap + detail_size.cx;
+    let left = rect.left + ((rect.right - rect.left - text_width) / 2).max(sc(2));
+    let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+    let _ = SetTextColor(hdc, COLORREF(Color::from_hex("#17324C").to_colorref()));
+    let mut prefix_rect = RECT { left, ..rect };
+    DrawTextW(hdc, &mut prefix, &mut prefix_rect, flags);
+    SelectObject(hdc, detail_font);
+    let mut detail_rect = RECT {
+        left: left + prefix_size.cx + gap,
+        ..rect
+    };
+    DrawTextW(hdc, &mut detail, &mut detail_rect, flags | DT_END_ELLIPSIS);
+
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(prefix_font);
+    let _ = DeleteObject(detail_font);
 }
 
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
@@ -4640,9 +5041,9 @@ fn draw_usage_bar(
     appearance: Appearance,
 ) {
     let seg_w = sc(SEGMENT_W);
-    let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
     let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
+    let seg_h = appearance.bar_height();
     let corner_r = seg_h / 2;
     let bar_y = y + (appearance.row_height() - seg_h) / 2;
 
@@ -4739,6 +5140,59 @@ mod tests {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
         assert_eq!(usage_bar_fill_percentage(100.0, "剩余100%"), 100.0);
+    }
+
+    #[test]
+    fn codex_meter_matches_compact_browser_labels_and_time_marker() {
+        use poller::UsageWindowKind::{Session, Weekly};
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let short = UsageSection {
+            percentage: 53.0,
+            resets_at: Some(now + Duration::from_secs(49 * 60)),
+            ..Default::default()
+        };
+        let meter = CodexMeter::new(Some(&short), "47%", Session, now);
+        assert_eq!(meter.label(), ("5h", "47 / 16 (49m)".into()));
+        assert_eq!(meter.remaining_quota, Some(47.0));
+
+        let weekly = UsageSection {
+            percentage: 20.0,
+            resets_at: Some(now + Duration::from_secs(49 * 3600)),
+            window_duration: Some(Duration::from_secs(7 * 86400)),
+        };
+        let meter = CodexMeter::new(Some(&weekly), "80%", Weekly, now);
+        assert_eq!(meter.label(), ("7d", "80 / 29 (2d1h)".into()));
+        assert_eq!(meter.remaining_time.unwrap().0, 49.0 / 168.0);
+
+        assert_eq!(
+            CodexMeter::new(None, "--", Session, now).label(),
+            ("5h", "--".into())
+        );
+        let mut short = short;
+        short.resets_at = None;
+        assert_eq!(
+            CodexMeter::new(Some(&short), "47%", Session, now).label(),
+            ("5h", "47 / --".into())
+        );
+        short.resets_at = Some(now - Duration::from_secs(1));
+        assert_eq!(
+            CodexMeter::new(Some(&short), "47% *", Session, now).label(),
+            ("5h", "47 / 0 (0m)*".into())
+        );
+    }
+
+    #[test]
+    fn codex_rows_close_the_gap_without_changing_bar_height() {
+        let appearance = Appearance::default();
+        for height in [sc(40), sc(WIDGET_HEIGHT)] {
+            let [session_y, weekly_y] = usage_row_positions(height, appearance, true, true, true);
+            let session = codex_meter_rect(0, session_y, sc(CODEX_METER_WIDTH), appearance);
+            let weekly = codex_meter_rect(0, weekly_y, sc(CODEX_METER_WIDTH), appearance);
+            let bar_height = appearance.row_height() - sc(5);
+            assert_eq!(session.bottom - session.top, bar_height);
+            assert_eq!(weekly.bottom - weekly.top, bar_height);
+            assert_eq!(weekly.top - session.bottom, sc(3));
+        }
     }
 
     #[test]
@@ -5015,6 +5469,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_meter_text_defaults_to_visible_and_persists_when_hidden() {
+        let old: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(old.show_codex_meter_text);
+        let hidden = SettingsFile {
+            show_codex_meter_text: false,
+            ..old
+        };
+        let restored: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&hidden).unwrap()).unwrap();
+        assert!(!restored.show_codex_meter_text);
+    }
+
+    #[test]
     fn unavailable_claude_cli_is_disabled_without_disabling_codex() {
         let settings = SettingsFile {
             show_claude_code: true,
@@ -5052,6 +5519,7 @@ mod tests {
         let first = crate::models::UsageSection {
             percentage: 85.0,
             resets_at: Some(first_reset),
+            ..Default::default()
         };
 
         append_quota_alert(
@@ -5084,6 +5552,7 @@ mod tests {
         let next = crate::models::UsageSection {
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
+            ..Default::default()
         };
         append_quota_alert(
             &mut alerts,
